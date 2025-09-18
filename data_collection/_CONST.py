@@ -7,3 +7,4 @@ class _Const:
     
     DEVICE_NAME = "wiros_pi_node_1"
     ROS_TOPIC = "/csi"
+    HEALTH_ENDPOINT = "http://137.110.198.43:8000/health"

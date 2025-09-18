@@ -8,7 +8,7 @@ We then post this binary file and metadata to our ingestion server so it can pla
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-import time, os
+import time, os, requests
 from rf_msgs.msg import Wifi # type: ignore - Compilation warning was incorrect
 from _CONST import _Const
 
@@ -27,10 +27,10 @@ class CSICollector(Node):
         self.file_name = str(time.time()) + self.CONST.DEVICE_NAME # file names must be unique and include a device identifier in order to be stored/managed by the S3 server
         self.CSI_file_metadata = []
         
-        # Create QoS profile to match the publisher (reliable)
+        # Create QoS profile to match the publisher (best_effort)
         qos_profile = QoSProfile(
             depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,  # Match the publisher
+            reliability=ReliabilityPolicy.BEST_EFFORT,  # Match the publisher
             durability=DurabilityPolicy.VOLATILE
         )
         
@@ -50,12 +50,17 @@ class CSICollector(Node):
     # publish it to the ingestion server and restart the process
     def callback(self, msg):
         print("received CSI Data")
-        self.get_logger().info(f'Received CSI data: {msg}')
+        # self.get_logger().info(f'Received CSI data: {msg}')
+        print("pinging server")
+        resp = requests.post(self.CONST.HEALTH_ENDPOINT)
+        print(resp)
         # TODO: Implement CSI data processing and file writing logic
     
     
-# TODO: For now user MUST run
-# source ~/wifi_ws/install/setup.bash command before starting the collector - combine both into a bash startup script
+# TODO: For now user MUST DO FOLLOWING
+# 1) cd ~/wifi-deployment && ansible-playbook -i inventory.ini -K pb_start_collection.yml (password is robot123!) - if this fails run sudo reboot now
+# 2) source ~/wifi_ws/install/setup.bash command before starting the collector
+# 3) python3 collector.py combine steps into a bash startup script
 def main():
     print("starting CSI data collection service")
     
