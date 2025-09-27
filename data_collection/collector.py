@@ -36,7 +36,7 @@ class CSICollector(Node):
         # Create QoS profile to match the publisher (best_effort)
         qos_profile = QoSProfile(
             depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,  # Match the publisher
+            reliability=ReliabilityPolicy.RELIABLE,  # Match the publisher
             durability=DurabilityPolicy.VOLATILE
         )
         
@@ -86,14 +86,19 @@ class CSICollector(Node):
     def callback(self, msg):
         if self.error_flag:
             print("error detected during data collection")
-            
+        
+        # write data to file and update globals
+        bytes_written_before_upload = self.bytes_written_to_file
+        self.bytes_written_to_file += self.write_file(msg.csi_real,msg.csi_imag)
+        self.messages_received += 1
+        message_size = self.bytes_written_to_file - bytes_written_before_upload
         # grab message metadata and place it in file metadata array 
         message_metadata = {
             "mac_address" : self.convert_mac_address_to_string(msg.txmac),
             "timestamp" : msg.header.stamp.sec + msg.header.stamp.nanosec/(10**9),
-            "file_name" : self.file_name,
             "device_name" : self.CONST.DEVICE_NAME,
-            "offset_in_file" : self.bytes_written_to_file,
+            "offset_in_file" : bytes_written_before_upload,
+            "message_size" : message_size,
             "message_id": msg.msg_id,
             "access_point" : msg.ap_id,
             "channel_number" : msg.chan,
@@ -103,13 +108,9 @@ class CSICollector(Node):
             "spatial_channels" : msg.mcs,
             "rssi" : msg.rssi,
             "fc" : msg.fc,
-            "sequence_number" : msg.seq_num          
+            "sequence_number" : msg.seq_num   
         }
         self.CSI_file_metadata.append(message_metadata)
-        
-        # write data to file and update globals
-        self.bytes_written_to_file += self.write_file(msg.csi_real,msg.csi_imag)
-        self.messages_received += 1
         
         # if our file is full then reset variables and have a background thread send it to the ingestion server to process
         if self.messages_received  % self.CONST.NUMBER_OF_MESSAGES_PER_FILE == 0:
@@ -161,9 +162,9 @@ class CSICollector(Node):
                     with open(path, 'rb') as fh:
                         # send metadata as a single form field (JSON array) and the CSI blob as a file
                         data = {
-                            'metadata': json.dumps(metadata),
-                            'save_to_server' : save_to_local_server,
-                            'save_to_s3_storage' : save_to_s3_storage
+                            'metadata': json.dumps(metadata), # json array 
+                            'save_to_server' : save_to_local_server, # bool val
+                            'save_to_s3_storage' : save_to_s3_storage # bool val
                         }
                         files = {
                             'csi_blob': (os.path.basename(path), fh, 'application/octet-stream')
@@ -199,6 +200,61 @@ class CSICollector(Node):
 
             self.ingestion_queue.task_done()
 
+    def shutdown(self):
+        """Gracefully shutdown the collector"""
+        print("Starting graceful shutdown...")
+        
+        # 1. Close current file if open
+        if self.file_writer is not None:
+            try:
+                self.file_writer.flush()  # Ensure all data is written
+                self.file_writer.close()
+                print(f"Closed current file: {self.file_name}")
+            except Exception as e:
+                print(f"Error closing file: {e}")
+            self.file_writer = None
+        
+        # 2. Signal background thread to stop
+        self.stop_event.set()
+        
+        # 3. Process any remaining items in queue (with timeout)
+        remaining_items = 0
+        while not self.ingestion_queue.empty():
+            try:
+                remaining_items += 1
+                if remaining_items > 10:  # Prevent infinite wait
+                    print(f"Warning: {self.ingestion_queue.qsize()} items still in queue, forcing shutdown")
+                    break
+                time.sleep(0.1)  # Give worker time to process
+            except:
+                break
+        
+        # 4. Wait for background thread to finish (with timeout)
+        if self.ingestion_thread.is_alive():
+            print("Waiting for ingestion worker to finish...")
+            self.ingestion_thread.join(timeout=5.0)  # 5 second timeout
+            if self.ingestion_thread.is_alive():
+                print("Warning: Ingestion thread did not shutdown cleanly")
+        
+        # 5. Save any partial data if we have messages
+        if self.CSI_file_metadata and self.messages_received > 0:
+            try:
+                file_path = os.path.abspath(f'binary_data/{self.file_name}')
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    print(f"Saving partial batch with {len(self.CSI_file_metadata)} messages")
+                    self.ingestion_queue.put_nowait((
+                        copy.deepcopy(self.CSI_file_metadata), 
+                        file_path,
+                        self.CONST.SAVE_TO_INGESTION_SERVER, 
+                        self.CONST.SAVE_TO_S3_STORAGE
+                    ))
+                    # Give one last chance to process
+                    time.sleep(1.0)
+            except Exception as e:
+                print(f"Error saving partial data: {e}")
+        
+        print("Graceful shutdown complete")
+
     
 # TODO: For now user MUST DO FOLLOWING
 # 1) cd ~/wifi-deployment && ansible-playbook -i inventory.ini -K pb_start_collection.yml (password is robot123!) - if this fails run sudo reboot now
@@ -217,10 +273,32 @@ def main():
     try:
         rclpy.spin(csi_collector)
     except KeyboardInterrupt:
-        print("Shutting down CSI collector...")
+        print("\nReceived shutdown signal (Ctrl+C)")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
     finally:
-        csi_collector.destroy_node()
-        rclpy.shutdown()
+        # Graceful shutdown sequence
+        try:
+            csi_collector.shutdown()
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
+        
+        # Clean up ROS
+        try:
+            csi_collector.destroy_node()
+        except Exception as e:
+            print(f"Error destroying node: {e}")
+            
+        # Only shutdown if ROS context is still active
+        try:
+            if rclpy.ok():  # Check if ROS context is still running
+                rclpy.shutdown()
+        except Exception as e:
+            # Ignore double shutdown errors
+            if "rcl_shutdown already called" not in str(e):
+                print(f"Error shutting down RclPy: {e}")
+            
+        print("CSI collector stopped")
 
 if __name__ == "__main__":
     main()
